@@ -1,0 +1,42 @@
+[
+  {
+    "name": "openai",
+    "domains": ["api.openai.com"],
+    "allowed_paths": ["/v1/chat/completions", "/v1/audio/transcriptions"],
+    "blocked_paths": ["/v1/files", "/v1/fine_tuning", "/v1/images"],
+    "max_requests_per_minute": 30,
+    "max_request_body_kb": 5120
+  },
+  {
+    "name": "anthropic",
+    "domains": ["api.anthropic.com"],
+    "allowed_paths": ["/v1/messages"],
+    "max_requests_per_minute": 30
+  },
+  {
+    "name": "spotify_api",
+    "domains": ["api.spotify.com"],
+    "allowed_paths": ["/v1/search", "/v1/me/player"],
+    "blocked_paths": ["/v1/me/following", "/v1/users"],
+    "max_requests_per_minute": 60
+  },
+  {
+    "name": "spotify_auth",
+    "domains": ["accounts.spotify.com"],
+    "allowed_paths": ["/api/token", "/authorize"],
+    "max_requests_per_minute": 10
+  },
+  {
+    "name": "edge_tts",
+    "domains": ["speech.platform.bing.com"],
+    "allowed_paths": ["/"],
+    "max_requests_per_minute": 60
+  },
+  {
+    "name": "youtube",
+    "domains": ["www.youtube.com", "youtube.com", "youtu.be"],
+    "allowed_paths": ["/"],
+    "allowed_methods": ["GET"],
+    "max_requests_per_minute": 30
+  }
+]

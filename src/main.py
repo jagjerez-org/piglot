@@ -14,6 +14,7 @@ from src.audio.wake_word import WakeWordDetector
 from src.brain.conversation import ConversationManager
 from src.brain.engine import create_brain
 from src.config import load_config
+from src.proxy.gateway import ProxyGateway, load_custom_services
 from src.stt.engine import create_stt_engine
 from src.tts.engine import create_tts_engine
 
@@ -26,6 +27,10 @@ class PiGlot:
     def __init__(self, config_path: str = "config/config.yaml") -> None:
         self.config = load_config(config_path)
         self.running = False
+
+        # Initialize proxy gateway (starts before everything else)
+        services = load_custom_services()
+        self.proxy = ProxyGateway(services=services)
 
         # Initialize components
         self.capture = AudioCapture(self.config.audio)
@@ -43,6 +48,10 @@ class PiGlot:
 
     async def run(self) -> None:
         """Main loop: listen → transcribe → think → speak."""
+        # Start proxy gateway first
+        await self.proxy.start()
+        console.print("[bold blue]🛡️  Proxy gateway running on :8899[/]")
+
         self.running = True
         console.print("[bold green]🥧 PiGlot is ready![/]")
         console.print(
