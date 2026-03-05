@@ -1,0 +1,61 @@
+# PiGlot Configuration
+# Copy to config.yaml and edit with your settings
+
+piglot:
+  wake_word: "piglot"
+  language: "es"               # your native language
+  target_language: "en"        # language you're learning
+  level: "beginner"            # beginner | intermediate | advanced
+
+audio:
+  input_device: "default"
+  output_device: "default"
+  sample_rate: 16000
+  silence_threshold: 500       # RMS threshold for silence detection
+  silence_duration: 1.5        # seconds of silence before stopping capture
+  max_record_seconds: 30       # max recording length
+
+stt:
+  engine: "whisper_local"      # whisper_local | whisper_api
+  model: "base"                # tiny | base | small (for local whisper)
+  language: null               # auto-detect, or force e.g. "fr"
+
+tts:
+  engine: "edge"               # edge | elevenlabs
+  voice: null                  # auto-select based on target_language, or override
+  speed: 1.0                   # speech speed multiplier
+  # elevenlabs_api_key: ""     # only needed for elevenlabs engine
+
+brain:
+  provider: "openai"           # openai | anthropic | ollama
+  model: "gpt-4o-mini"
+  api_key: "${OPENAI_API_KEY}" # reads from environment variable
+  temperature: 0.7
+  max_tokens: 500
+  # For Anthropic:
+  # provider: "anthropic"
+  # model: "claude-sonnet-4-20250514"
+  # api_key: "${ANTHROPIC_API_KEY}"
+  # For local Ollama:
+  # provider: "ollama"
+  # model: "llama3"
+  # base_url: "http://localhost:11434"
+
+spotify:
+  enabled: false
+  client_id: ""
+  client_secret: ""
+  redirect_uri: "http://localhost:8888/callback"
+  device_name: "PiGlot"
+
+learning:
+  session_duration_minutes: 15
+  daily_goal_minutes: 30
+  review_interval_hours: 24
+  vocabulary_db: "data/vocabulary.db"
+  progress_file: "data/progress.json"
+
+hardware:
+  leds_enabled: false
+  button_pin: null             # GPIO pin for physical button, null = disabled
+  led_pin: null                # GPIO pin for status LED / NeoPixel data

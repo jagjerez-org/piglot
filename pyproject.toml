@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "piglot"
+version = "0.1.0"
+description = "AI Language Learning Assistant for Raspberry Pi"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "anthropic>=0.30",
+    "openai-whisper>=20231117",
+    "edge-tts>=6.1",
+    "sounddevice>=0.4",
+    "soundfile>=0.12",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "openwakeword>=0.6",
+    "spotipy>=2.23",
+    "pydantic>=2.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+elevenlabs = [
+    "elevenlabs>=1.0",
+]
+hardware = [
+    "RPi.GPIO>=0.7",
+    "rpi-ws281x>=5.0",
+]
+
+[project.scripts]
+piglot = "src.main:main"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
