@@ -6,8 +6,9 @@ __pycache__/
 dist/
 build/
 
-# Config (contains API keys)
+# Config (contains API keys / tokens)
 config/config.yaml
+gateway/.env
 
 # Data
 data/*.db

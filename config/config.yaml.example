@@ -7,6 +7,16 @@ piglot:
   target_language: "en"        # language you're learning
   level: "beginner"            # beginner | intermediate | advanced
 
+# ─── Gateway Mode (RECOMMENDED for production) ──────────────
+# When enabled, the Pi talks ONLY to your gateway.
+# No API keys on the device. No direct internet access needed.
+gateway:
+  enabled: false
+  url: "https://api.piglot.com"  # your gateway URL
+  device_token: ""                # from: POST /admin/devices
+
+# ─── Direct Mode (dev/testing only) ─────────────────────────
+# These settings are ignored when gateway.enabled = true
 audio:
   input_device: "default"
   output_device: "default"

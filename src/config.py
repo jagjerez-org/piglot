@@ -32,6 +32,13 @@ class TTSConfig(BaseModel):
     elevenlabs_api_key: str | None = None
 
 
+class GatewayConfig(BaseModel):
+    """When enabled, ALL external calls go through the gateway. No direct API access."""
+    enabled: bool = False
+    url: str = ""              # e.g. https://api.piglot.com
+    device_token: str = ""     # e.g. pgl_abc123...
+
+
 class BrainConfig(BaseModel):
     provider: Literal["openai", "anthropic", "ollama"] = "openai"
     model: str = "gpt-4o-mini"
@@ -72,6 +79,7 @@ class PiGlotConfig(BaseModel):
 
 class Config(BaseModel):
     piglot: PiGlotConfig = Field(default_factory=PiGlotConfig)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     stt: STTConfig = Field(default_factory=STTConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
