@@ -1,22 +1,22 @@
 """
-PiGlot Cloud Gateway
+PiGlot Cloud Gateway — Intent-based architecture.
 
-This is the server-side component that runs on YOUR infrastructure (VPS, cloud).
-PiGlot devices connect ONLY to this gateway. The gateway then proxies to
-external services (OpenAI, Spotify, etc).
+The device sends intents (structured requests). The gateway validates
+permissions, checks rate limits, and ONLY THEN executes.
 
-Benefits:
-- API keys never touch the device
-- Per-device auth, usage tracking, rate limiting
-- You can revoke a device instantly
-- Central billing and monitoring
-- Devices only need to know one URL
+The LLM NEVER calls APIs directly. It produces intents. The gateway decides.
 
-Architecture:
-  PiGlot Device → [internet] → Gateway → OpenAI / Spotify / YouTube / etc.
-       ↑                           ↑
-  device_token              api_keys + secrets
-  (revocable)               (safe on your server)
+Flow:
+  1. Pi captures voice → Whisper transcribes (on gateway)
+  2. Gateway sends transcript to LLM → LLM returns intent JSON
+  3. Gateway validates intent (schema + permissions + rate limit)
+  4. Gateway executes intent (calls Spotify, YouTube, etc.)
+  5. Gateway sends back: spoken reply + action result
+  6. Pi speaks the reply
+
+The Pi only makes 2 types of requests:
+  POST /v1/turn    — "here's what the user said" (full pipeline)
+  POST /v1/intent  — "execute this intent" (pre-parsed)
 """
 
 from __future__ import annotations
@@ -28,11 +28,15 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web, ClientSession, ClientTimeout
+
+from src.intents.schema import Intent, IntentType, validate_intent
+from src.intents.extractor import build_system_prompt, parse_intent
+from src.intents.executor import IntentExecutor
 
 logger = logging.getLogger("piglot.gateway")
 
@@ -41,30 +45,27 @@ logger = logging.getLogger("piglot.gateway")
 
 @dataclass
 class Device:
-    """Registered PiGlot device."""
     device_id: str
-    token_hash: str  # SHA-256 of device token (never store raw)
+    token_hash: str
     name: str = ""
     owner: str = ""
-    plan: str = "free"  # free | basic | premium
+    plan: str = "free"
     created_at: str = ""
     last_seen: str = ""
     enabled: bool = True
-    # Usage tracking
+    native_lang: str = "es"
+    target_lang: str = "en"
+    level: str = "beginner"
     requests_today: int = 0
     requests_total: int = 0
-    tokens_used_today: int = 0
     last_reset: str = ""
 
     @property
     def daily_limit(self) -> int:
-        limits = {"free": 100, "basic": 1000, "premium": 10000}
-        return limits.get(self.plan, 100)
+        return {"free": 100, "basic": 1000, "premium": 10000}.get(self.plan, 100)
 
 
 class DeviceRegistry:
-    """Manage registered devices."""
-
     def __init__(self, db_path: str = "data/devices.json") -> None:
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,170 +73,234 @@ class DeviceRegistry:
 
     def _load(self) -> dict[str, Device]:
         if self.path.exists():
-            data = json.loads(self.path.read_text())
-            return {k: Device(**v) for k, v in data.items()}
+            return {k: Device(**v) for k, v in json.loads(self.path.read_text()).items()}
         return {}
 
     def _save(self) -> None:
-        data = {k: v.__dict__ for k, v in self.devices.items()}
-        self.path.write_text(json.dumps(data, indent=2))
+        self.path.write_text(json.dumps({k: v.__dict__ for k, v in self.devices.items()}, indent=2))
 
-    def register_device(self, name: str = "", owner: str = "", plan: str = "free") -> tuple[str, str]:
-        """Register a new device. Returns (device_id, raw_token)."""
+    def register(self, name: str = "", owner: str = "", plan: str = "free",
+                 native_lang: str = "es", target_lang: str = "en", level: str = "beginner") -> tuple[str, str]:
         device_id = str(uuid.uuid4())[:8]
         raw_token = f"pgl_{uuid.uuid4().hex}"
-        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-
         self.devices[device_id] = Device(
             device_id=device_id,
-            token_hash=token_hash,
-            name=name,
-            owner=owner,
-            plan=plan,
+            token_hash=hashlib.sha256(raw_token.encode()).hexdigest(),
+            name=name, owner=owner, plan=plan,
+            native_lang=native_lang, target_lang=target_lang, level=level,
             created_at=datetime.utcnow().isoformat(),
         )
         self._save()
         return device_id, raw_token
 
     def authenticate(self, token: str) -> Device | None:
-        """Authenticate a device by token. Returns Device or None."""
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        for device in self.devices.values():
-            if device.token_hash == token_hash and device.enabled:
-                return device
+        h = hashlib.sha256(token.encode()).hexdigest()
+        for d in self.devices.values():
+            if d.token_hash == h and d.enabled:
+                return d
         return None
 
-    def track_usage(self, device_id: str, tokens_used: int = 0) -> bool:
-        """Track a request. Returns False if over limit."""
-        device = self.devices.get(device_id)
-        if not device:
+    def track_usage(self, device_id: str) -> bool:
+        d = self.devices.get(device_id)
+        if not d:
             return False
-
         today = datetime.utcnow().date().isoformat()
-        if device.last_reset != today:
-            device.requests_today = 0
-            device.tokens_used_today = 0
-            device.last_reset = today
-
-        if device.requests_today >= device.daily_limit:
+        if d.last_reset != today:
+            d.requests_today = 0
+            d.last_reset = today
+        if d.requests_today >= d.daily_limit:
             return False
-
-        device.requests_today += 1
-        device.requests_total += 1
-        device.tokens_used_today += tokens_used
-        device.last_seen = datetime.utcnow().isoformat()
+        d.requests_today += 1
+        d.requests_total += 1
+        d.last_seen = datetime.utcnow().isoformat()
         self._save()
         return True
 
-    def revoke_device(self, device_id: str) -> bool:
-        """Disable a device immediately."""
-        device = self.devices.get(device_id)
-        if device:
-            device.enabled = False
+    def revoke(self, device_id: str) -> bool:
+        d = self.devices.get(device_id)
+        if d:
+            d.enabled = False
             self._save()
             return True
         return False
 
 
-# ─── Service Backends ─────────────────────────────────────────────────
-
-@dataclass
-class ServiceBackend:
-    """Configuration for an upstream service."""
-    name: str
-    base_url: str
-    api_key_env: str  # Environment variable name for the API key
-    headers: dict[str, str] = field(default_factory=dict)
-    timeout_seconds: int = 120
-
-
-DEFAULT_BACKENDS: dict[str, ServiceBackend] = {
-    "chat": ServiceBackend(
-        name="openai_chat",
-        base_url="https://api.openai.com/v1",
-        api_key_env="OPENAI_API_KEY",
-        headers={"Content-Type": "application/json"},
-    ),
-    "chat_anthropic": ServiceBackend(
-        name="anthropic_chat",
-        base_url="https://api.anthropic.com/v1",
-        api_key_env="ANTHROPIC_API_KEY",
-        headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
-    ),
-    "stt": ServiceBackend(
-        name="openai_stt",
-        base_url="https://api.openai.com/v1",
-        api_key_env="OPENAI_API_KEY",
-    ),
-    "tts": ServiceBackend(
-        name="elevenlabs_tts",
-        base_url="https://api.elevenlabs.io/v1",
-        api_key_env="ELEVENLABS_API_KEY",
-    ),
-    "spotify": ServiceBackend(
-        name="spotify",
-        base_url="https://api.spotify.com/v1",
-        api_key_env="SPOTIFY_ACCESS_TOKEN",
-    ),
-}
-
-
 # ─── Gateway Server ──────────────────────────────────────────────────
 
 class PiGlotGateway:
-    """
-    Cloud gateway server.
-
-    Endpoints exposed to devices:
-      POST /v1/chat          → LLM chat completion
-      POST /v1/transcribe    → Speech-to-text
-      POST /v1/synthesize    → Text-to-speech
-      POST /v1/spotify/{action} → Spotify control
-      GET  /v1/device/status → Device status + usage
-
-    Admin endpoints:
-      GET  /admin/devices         → List all devices
-      POST /admin/devices         → Register new device
-      POST /admin/devices/{id}/revoke → Revoke device
-      GET  /admin/stats           → Usage statistics
-    """
-
     def __init__(
         self,
-        port: int = 443,
-        backends: dict[str, ServiceBackend] | None = None,
+        port: int = 8080,
         admin_token: str | None = None,
     ) -> None:
         self.port = port
-        self.backends = backends or DEFAULT_BACKENDS
         self.registry = DeviceRegistry()
+        self.executor = IntentExecutor()
         self.admin_token = admin_token or os.environ.get("PIGLOT_ADMIN_TOKEN", "")
-        self._session: ClientSession | None = None
+        self._llm_session: ClientSession | None = None
 
-    async def _get_session(self) -> ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = ClientSession(timeout=ClientTimeout(total=120))
-        return self._session
-
-    # ─── Auth middleware ──────────────────────────────
+    async def _get_llm_session(self) -> ClientSession:
+        if self._llm_session is None or self._llm_session.closed:
+            self._llm_session = ClientSession(timeout=ClientTimeout(total=60))
+        return self._llm_session
 
     def _auth_device(self, request: web.Request) -> Device | None:
-        """Authenticate device from Authorization header."""
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return None
-        token = auth[7:]
-        return self.registry.authenticate(token)
+        return self.registry.authenticate(auth[7:])
 
     def _auth_admin(self, request: web.Request) -> bool:
-        """Authenticate admin from X-Admin-Token header."""
-        token = request.headers.get("X-Admin-Token", "")
-        return token == self.admin_token and self.admin_token != ""
+        return request.headers.get("X-Admin-Token", "") == self.admin_token and self.admin_token != ""
 
-    # ─── Device endpoints ─────────────────────────────
+    # ─── Core: Full turn (voice → intent → execute → reply) ────
 
-    async def handle_chat(self, request: web.Request) -> web.Response:
-        """POST /v1/chat — Proxy chat to LLM."""
+    async def handle_turn(self, request: web.Request) -> web.Response:
+        """
+        POST /v1/turn
+
+        The main endpoint. Device sends user's text, gateway:
+        1. Builds prompt with device context + preferences
+        2. Calls LLM → gets intent JSON
+        3. Validates intent
+        4. Executes intent
+        5. Returns spoken reply + result
+
+        Body: { "text": "pon música en francés", "history": [...] }
+        """
+        device = self._auth_device(request)
+        if not device:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if not self.registry.track_usage(device.device_id):
+            return web.json_response({"error": "daily_limit_exceeded"}, status=429)
+
+        body = await request.json()
+        user_text = body.get("text", "")
+        history = body.get("history", [])
+
+        if not user_text.strip():
+            return web.json_response({"error": "empty_text"}, status=400)
+
+        # 1. Get device preferences
+        prefs = self.executor._preferences.get(device.device_id, {})
+
+        # 2. Build LLM prompt
+        system_prompt = build_system_prompt(
+            native_lang=device.native_lang,
+            target_lang=device.target_lang,
+            level=device.level,
+            preferences=prefs,
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
+        # Add conversation history (limited)
+        for msg in history[-20:]:
+            messages.append(msg)
+        messages.append({"role": "user", "content": user_text})
+
+        # 3. Call LLM
+        llm_response = await self._call_llm(messages, device)
+        if llm_response is None:
+            return web.json_response({"error": "llm_unavailable"}, status=503)
+
+        # 4. Parse intent from LLM output
+        intent = parse_intent(llm_response)
+
+        # 5. Validate intent
+        validation_error = validate_intent(intent, device.plan)
+        if validation_error:
+            logger.warning(
+                "Intent rejected — device=%s action=%s error=%s",
+                device.device_id, intent.action, validation_error,
+            )
+            # Don't tell the user about internal validation — just reply normally
+            return web.json_response({
+                "reply": intent.reply or "Sorry, I can't do that right now.",
+                "intent": {"action": "reply", "executed": False},
+            })
+
+        # 6. Execute intent
+        result = await self.executor.execute(intent, device.device_id, device.plan)
+
+        # 7. Return reply + result
+        return web.json_response({
+            "reply": intent.reply,
+            "intent": {
+                "action": intent.action,
+                "executed": result.success,
+                "data": result.data,
+                "error": result.error,
+            },
+        })
+
+    async def _call_llm(self, messages: list[dict], device: Device) -> str | None:
+        """Call the LLM provider. Returns raw text output."""
+        session = await self._get_llm_session()
+
+        # Try OpenAI first, then Anthropic
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+        if openai_key:
+            try:
+                async with session.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    json={
+                        "model": os.environ.get("PIGLOT_MODEL", "gpt-4o-mini"),
+                        "messages": messages,
+                        "temperature": 0.7,
+                        "max_tokens": 500,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {openai_key}",
+                        "Content-Type": "application/json",
+                    },
+                ) as resp:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"]
+            except Exception as e:
+                logger.error("OpenAI call failed: %s", e)
+
+        if anthropic_key:
+            try:
+                system = ""
+                chat_msgs = []
+                for m in messages:
+                    if m["role"] == "system":
+                        system = m["content"]
+                    else:
+                        chat_msgs.append(m)
+                async with session.post(
+                    "https://api.anthropic.com/v1/messages",
+                    json={
+                        "model": os.environ.get("PIGLOT_MODEL", "claude-sonnet-4-20250514"),
+                        "system": system,
+                        "messages": chat_msgs,
+                        "max_tokens": 500,
+                    },
+                    headers={
+                        "x-api-key": anthropic_key,
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    },
+                ) as resp:
+                    data = await resp.json()
+                    return data["content"][0]["text"]
+            except Exception as e:
+                logger.error("Anthropic call failed: %s", e)
+
+        return None
+
+    # ─── Direct intent execution (pre-parsed) ────────
+
+    async def handle_intent(self, request: web.Request) -> web.Response:
+        """
+        POST /v1/intent
+
+        Execute a pre-parsed intent. For when the device handles LLM locally.
+
+        Body: { "action": "spotify.play", "params": {"query": "..."}, "reply": "..." }
+        """
         device = self._auth_device(request)
         if not device:
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -244,165 +309,82 @@ class PiGlotGateway:
 
         body = await request.json()
 
-        # Determine backend (default OpenAI, can specify anthropic)
-        provider = body.pop("provider", "openai")
-        backend = self.backends.get(
-            "chat_anthropic" if provider == "anthropic" else "chat"
-        )
-        if not backend:
-            return web.json_response({"error": "provider_not_configured"}, status=400)
+        try:
+            intent = Intent(**body)
+        except Exception as e:
+            return web.json_response({"error": f"invalid_intent: {e}"}, status=400)
 
-        api_key = os.environ.get(backend.api_key_env, "")
-        if not api_key:
-            return web.json_response({"error": "provider_not_available"}, status=503)
+        validation_error = validate_intent(intent, device.plan)
+        if validation_error:
+            return web.json_response({"error": validation_error}, status=403)
 
-        # Forward to provider
-        session = await self._get_session()
-        headers = {**backend.headers}
+        result = await self.executor.execute(intent, device.device_id, device.plan)
+        return web.json_response({
+            "success": result.success,
+            "action": result.action,
+            "data": result.data,
+            "error": result.error,
+        })
 
-        if provider == "anthropic":
-            headers["x-api-key"] = api_key
-            url = f"{backend.base_url}/messages"
-        else:
-            headers["Authorization"] = f"Bearer {api_key}"
-            url = f"{backend.base_url}/chat/completions"
-
-        async with session.post(url, json=body, headers=headers) as resp:
-            result = await resp.json()
-            return web.json_response(result, status=resp.status)
+    # ─── Transcribe (STT on gateway) ─────────────────
 
     async def handle_transcribe(self, request: web.Request) -> web.Response:
-        """POST /v1/transcribe — Proxy audio to Whisper API."""
+        """POST /v1/transcribe — STT via Whisper API."""
         device = self._auth_device(request)
         if not device:
             return web.json_response({"error": "unauthorized"}, status=401)
         if not self.registry.track_usage(device.device_id):
             return web.json_response({"error": "daily_limit_exceeded"}, status=429)
 
-        backend = self.backends.get("stt")
-        if not backend:
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        if not openai_key:
             return web.json_response({"error": "stt_not_configured"}, status=503)
 
-        api_key = os.environ.get(backend.api_key_env, "")
-        session = await self._get_session()
-
-        # Forward multipart form data
         data = await request.read()
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-        }
-        # Pass through content-type with boundary
         ct = request.headers.get("Content-Type", "")
-        if ct:
-            headers["Content-Type"] = ct
+        session = await self._get_llm_session()
 
         async with session.post(
-            f"{backend.base_url}/audio/transcriptions",
+            "https://api.openai.com/v1/audio/transcriptions",
             data=data,
-            headers=headers,
+            headers={"Authorization": f"Bearer {openai_key}", "Content-Type": ct},
         ) as resp:
-            result = await resp.read()
-            return web.Response(
-                body=result,
-                status=resp.status,
-                content_type=resp.content_type,
-            )
+            return web.Response(body=await resp.read(), status=resp.status, content_type=resp.content_type)
+
+    # ─── Synthesize (TTS on gateway) ─────────────────
 
     async def handle_synthesize(self, request: web.Request) -> web.Response:
-        """POST /v1/synthesize — Proxy text to TTS."""
+        """POST /v1/synthesize — TTS via Edge TTS (free)."""
         device = self._auth_device(request)
         if not device:
             return web.json_response({"error": "unauthorized"}, status=401)
-        if not self.registry.track_usage(device.device_id):
-            return web.json_response({"error": "daily_limit_exceeded"}, status=429)
 
         body = await request.json()
         text = body.get("text", "")
-        voice = body.get("voice", "")
-        engine = body.get("engine", "edge")
+        voice = body.get("voice", "en-US-AriaNeural")
 
-        if engine == "edge":
-            # Edge TTS runs on the gateway itself (free, no API key needed)
-            import edge_tts
-            import tempfile
+        import edge_tts
+        import tempfile
 
-            communicate = edge_tts.Communicate(text, voice or "en-US-AriaNeural")
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                tmp_path = f.name
-            try:
-                await communicate.save(tmp_path)
-                audio = Path(tmp_path).read_bytes()
-                return web.Response(body=audio, content_type="audio/mpeg")
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
+        communicate = edge_tts.Communicate(text, voice)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            tmp_path = f.name
+        try:
+            await communicate.save(tmp_path)
+            audio = Path(tmp_path).read_bytes()
+            return web.Response(body=audio, content_type="audio/mpeg")
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
-        elif engine == "elevenlabs":
-            backend = self.backends.get("tts")
-            if not backend:
-                return web.json_response({"error": "tts_not_configured"}, status=503)
-            api_key = os.environ.get(backend.api_key_env, "")
-            session = await self._get_session()
-            async with session.post(
-                f"{backend.base_url}/text-to-speech/{voice}",
-                json={"text": text, "model_id": "eleven_multilingual_v2"},
-                headers={"xi-api-key": api_key, "Content-Type": "application/json"},
-            ) as resp:
-                audio = await resp.read()
-                return web.Response(body=audio, content_type="audio/mpeg", status=resp.status)
-
-        return web.json_response({"error": "unknown_engine"}, status=400)
-
-    async def handle_spotify(self, request: web.Request) -> web.Response:
-        """POST /v1/spotify/{action} — Spotify control."""
-        device = self._auth_device(request)
-        if not device:
-            return web.json_response({"error": "unauthorized"}, status=401)
-        if not self.registry.track_usage(device.device_id):
-            return web.json_response({"error": "daily_limit_exceeded"}, status=429)
-
-        action = request.match_info.get("action", "")
-        body = await request.json() if request.can_read_body else {}
-
-        # TODO: Implement Spotify OAuth flow per-device
-        # For now, uses a shared token
-        spotify_token = os.environ.get("SPOTIFY_ACCESS_TOKEN", "")
-        if not spotify_token:
-            return web.json_response({"error": "spotify_not_configured"}, status=503)
-
-        session = await self._get_session()
-        headers = {"Authorization": f"Bearer {spotify_token}"}
-        base = "https://api.spotify.com/v1"
-
-        if action == "search":
-            q = body.get("query", "")
-            async with session.get(f"{base}/search?q={q}&type=track&limit=5", headers=headers) as resp:
-                return web.json_response(await resp.json(), status=resp.status)
-        elif action == "play":
-            uri = body.get("uri", "")
-            device_id = body.get("device_id")
-            payload = {"uris": [uri]} if uri else {}
-            url = f"{base}/me/player/play"
-            if device_id:
-                url += f"?device_id={device_id}"
-            async with session.put(url, json=payload, headers=headers) as resp:
-                return web.Response(status=resp.status)
-        elif action == "pause":
-            async with session.put(f"{base}/me/player/pause", headers=headers) as resp:
-                return web.Response(status=resp.status)
-        elif action == "next":
-            async with session.post(f"{base}/me/player/next", headers=headers) as resp:
-                return web.Response(status=resp.status)
-        elif action == "devices":
-            async with session.get(f"{base}/me/player/devices", headers=headers) as resp:
-                return web.json_response(await resp.json(), status=resp.status)
-
-        return web.json_response({"error": "unknown_action"}, status=400)
+    # ─── Device status ───────────────────────────────
 
     async def handle_device_status(self, request: web.Request) -> web.Response:
-        """GET /v1/device/status — Device info + usage."""
         device = self._auth_device(request)
         if not device:
             return web.json_response({"error": "unauthorized"}, status=401)
+
+        prefs = self.executor._preferences.get(device.device_id, {})
+        vocab = self.executor._vocabulary.get(device.device_id, [])
 
         return web.json_response({
             "device_id": device.device_id,
@@ -410,86 +392,82 @@ class PiGlotGateway:
             "plan": device.plan,
             "requests_today": device.requests_today,
             "daily_limit": device.daily_limit,
-            "requests_total": device.requests_total,
-            "enabled": device.enabled,
+            "native_lang": device.native_lang,
+            "target_lang": device.target_lang,
+            "level": device.level,
+            "preferences": prefs,
+            "vocabulary_count": len(vocab),
         })
 
-    # ─── Admin endpoints ──────────────────────────────
+    # ─── Admin endpoints ─────────────────────────────
 
     async def handle_admin_devices(self, request: web.Request) -> web.Response:
-        """GET /admin/devices — List devices. POST to register."""
         if not self._auth_admin(request):
             return web.json_response({"error": "unauthorized"}, status=401)
 
         if request.method == "POST":
             body = await request.json()
-            device_id, token = self.registry.register_device(
+            device_id, token = self.registry.register(
                 name=body.get("name", ""),
                 owner=body.get("owner", ""),
                 plan=body.get("plan", "free"),
+                native_lang=body.get("native_lang", "es"),
+                target_lang=body.get("target_lang", "en"),
+                level=body.get("level", "beginner"),
             )
             return web.json_response({
                 "device_id": device_id,
-                "token": token,  # Only shown once!
+                "token": token,
                 "message": "Save this token — it won't be shown again.",
             })
 
-        # GET
-        devices = []
-        for d in self.registry.devices.values():
-            devices.append({
-                "device_id": d.device_id,
-                "name": d.name,
-                "owner": d.owner,
-                "plan": d.plan,
-                "enabled": d.enabled,
-                "requests_today": d.requests_today,
-                "requests_total": d.requests_total,
+        devices = [
+            {
+                "device_id": d.device_id, "name": d.name, "owner": d.owner,
+                "plan": d.plan, "enabled": d.enabled,
+                "requests_today": d.requests_today, "requests_total": d.requests_total,
                 "last_seen": d.last_seen,
-            })
+            }
+            for d in self.registry.devices.values()
+        ]
         return web.json_response(devices)
 
     async def handle_admin_revoke(self, request: web.Request) -> web.Response:
-        """POST /admin/devices/{id}/revoke — Revoke a device."""
         if not self._auth_admin(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-
         device_id = request.match_info["id"]
-        if self.registry.revoke_device(device_id):
-            return web.json_response({"status": "revoked", "device_id": device_id})
-        return web.json_response({"error": "device_not_found"}, status=404)
+        if self.registry.revoke(device_id):
+            return web.json_response({"status": "revoked"})
+        return web.json_response({"error": "not_found"}, status=404)
 
     async def handle_admin_stats(self, request: web.Request) -> web.Response:
-        """GET /admin/stats — Overall statistics."""
         if not self._auth_admin(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-
         devices = list(self.registry.devices.values())
         return web.json_response({
             "total_devices": len(devices),
-            "active_devices": sum(1 for d in devices if d.enabled),
-            "total_requests_today": sum(d.requests_today for d in devices),
-            "total_requests_all_time": sum(d.requests_total for d in devices),
+            "active": sum(1 for d in devices if d.enabled),
+            "requests_today": sum(d.requests_today for d in devices),
+            "requests_total": sum(d.requests_total for d in devices),
             "by_plan": {
-                "free": sum(1 for d in devices if d.plan == "free"),
-                "basic": sum(1 for d in devices if d.plan == "basic"),
-                "premium": sum(1 for d in devices if d.plan == "premium"),
+                p: sum(1 for d in devices if d.plan == p)
+                for p in ("free", "basic", "premium")
             },
         })
 
-    # ─── App ──────────────────────────────────────────
+    # ─── App ─────────────────────────────────────────
 
     def create_app(self) -> web.Application:
         app = web.Application()
 
         # Device endpoints
-        app.router.add_post("/v1/chat", self.handle_chat)
+        app.router.add_post("/v1/turn", self.handle_turn)
+        app.router.add_post("/v1/intent", self.handle_intent)
         app.router.add_post("/v1/transcribe", self.handle_transcribe)
         app.router.add_post("/v1/synthesize", self.handle_synthesize)
-        app.router.add_post("/v1/spotify/{action}", self.handle_spotify)
         app.router.add_get("/v1/device/status", self.handle_device_status)
 
-        # Admin endpoints
+        # Admin
         app.router.add_route("*", "/admin/devices", self.handle_admin_devices)
         app.router.add_post("/admin/devices/{id}/revoke", self.handle_admin_revoke)
         app.router.add_get("/admin/stats", self.handle_admin_stats)
